@@ -2,6 +2,10 @@
 use macroquad::prelude::*;
 use viggoskj_chess_lib::*;
 
+#[path = "./network.rs"]
+mod x;
+use x::cnet::*;
+
 
 struct ChessGame {
     game: game::Game,
@@ -92,26 +96,40 @@ fn draw_pieces(cg: &ChessGame, pt: &PieceTextures, x_org: u32, y_org: u32, squar
            let some_piece = cg.game.board.get_pice(i, j);
            if some_piece.is_some() {
                draw_texture(pt.get_texture(&some_piece.unwrap()), (x_org+square_size*j) as f32, (y_org+square_size*i) as f32, WHITE);
-
-                   /*
-               draw_text(
-                   some_piece.unwrap().to_char().to_string(),
-                   (x_org+square_size/2+square_size*j) as f32,
-                   (y_org+square_size/2+square_size*i) as f32,
-                   60.0,
-                   if some_piece.unwrap().piece_color == viggoskj_chess_lib::Color::Black {BLACK} else {WHITE},
-               );
-            */
            }
        }
    }
 }
 
 
-
+use std::env;
+// <cmd> host ( "w" | "b" )
+// (your color)
+// <cmd> client ip
 
 #[macroquad::main("Tjackis (Nu med grafik!!!!)")]
 async fn main() {
+    let args: Vec<String> = env::args().collect();
+    let mut cgc: ChessGameConnection;
+    let your_color: viggoskj_chess_lib::Color; 
+    let mut uhost = true;
+    if args[1] == "host" {
+        your_color = match args.get(2).unwrap().chars().nth(0).unwrap() {
+            'w' => viggoskj_chess_lib::Color::White,
+            'b' => viggoskj_chess_lib::Color::Black,
+            _ => panic!("Invalid second arg!"),
+        };
+        cgc = ChessGameConnection::make_host(your_color.other());
+    } else if args[1] == "client" {
+        let mut ip = args[2].clone();
+        ip.push_str(":6767");
+        (cgc, your_color) = ChessGameConnection::make_client(&ip);
+        uhost = false;
+    } else {
+        panic!("Invalid arg specified!");
+    }
+
+    let mut turn = viggoskj_chess_lib::Color::White;
     let mut chess_game = ChessGame::new();
     let ptexs = PieceTextures::new().await;
     let select_pos: (u32, u32) = (0, 0);
@@ -120,17 +138,72 @@ async fn main() {
     const sq_sz: u32 = 60;
     const x_max: u32 = x_origin + sq_sz*8;
     const y_max: u32 = y_origin + sq_sz*8;
-    let mut turn = viggoskj_chess_lib::Color::White;
     let mut selecting = false;
     let mut moves: Vec<BasicMove> = Vec::new();
     let mut sel_piece = (0, 0);
     let mut stop = false;
+    let mut await_opp = your_color == viggoskj_chess_lib::Color::Black;
     loop {
+        let mut state_str = match turn {
+            viggoskj_chess_lib::Color::White => "Turn: White",
+            viggoskj_chess_lib::Color::Black => "Turn: Black"
+        }.to_string();
         if stop {
             continue;
         }
+        draw_text( if uhost {"You are host" } else { "You are client"}, 400.0, 400.9, 10.0, BLACK);
+
+        if await_opp {
+            println!("AWAIT");
+            let m = get_move(&mut cgc);
+            let res = play_move(&chess_game.game, m);
+            if res.is_err() {
+                println!("REJECT");
+                send_response(&mut cgc, Resp::REJECT);
+                continue;
+            }
+            chess_game.game = res.unwrap();
+
+            if is_check(&chess_game.game) {
+                match get_check_state(&chess_game.game).unwrap() {
+                    CheckState::Stalemate => {
+                        draw_text(
+                            "stalemate",
+                            (x_origin+sq_sz*2) as f32,
+                            (y_origin+sq_sz*4) as f32,
+                            80.0,
+                            RED
+                        );
+                        stop = true;
+                        send_response(&mut cgc, Resp::STALEMATE);
+                        continue;
+                    },
+                    CheckState::Checkmate => {
+                        draw_text(
+                        match turn {
+                                viggoskj_chess_lib::Color::White => "Black Wins!",
+                                viggoskj_chess_lib::Color::Black => "White wins!",
+                            },
+                            (x_origin+sq_sz*1) as f32,
+                            (y_origin+sq_sz*4) as f32,
+                            80.0,
+                            RED
+                        );
+                        stop = true;
+                        send_response(&mut cgc, Resp::CHECKMATE);
+                        continue;
+                    }
+                    CheckState::Check => {
+                        state_str.push_str(" (Check)");
+                    }
+                }
+            }
+            send_response(&mut cgc, Resp::OK);
+            await_opp = false;
+            turn = your_color;
+        }
         clear_background(GRAY);
-        if is_mouse_button_pressed(MouseButton::Left) {
+        if is_mouse_button_pressed(MouseButton::Left) && turn == your_color {
             let (xf,yf) = mouse_position();
             let x = xf as u32;
             let y = yf as u32;
@@ -139,7 +212,7 @@ async fn main() {
                 let y_b = (y-y_origin) / sq_sz;
                 let some_p = chess_game.game.board.get_pice(y_b, x_b);
                 if some_p.is_some() {
-                    if some_p.unwrap().piece_color == turn {
+                    if some_p.unwrap().piece_color == your_color {
                         moves = Vec::new();
                         if !selecting {
                             selecting = true;
@@ -165,21 +238,51 @@ async fn main() {
                         }
                     }
                     if valid {
+                        let resp = send_move(&mut cgc, &Move::Basic { chess_move: valid_move.unwrap() }, &chess_game.game);
+                        if resp == Resp::REJECT {
+                            println!("REJECTED!");
+                            continue;
+                        }
                         match play_move(&chess_game.game, Move::Basic { chess_move: valid_move.unwrap() }) {
                             Ok(g) => {
                                 chess_game.game = g;
                                 selecting = false;
                                 moves = Vec::new();
-                                turn = match turn {
-                                    viggoskj_chess_lib::Color::Black => viggoskj_chess_lib::Color::White, 
-                                    viggoskj_chess_lib::Color::White => viggoskj_chess_lib::Color::Black, 
-                                }
+                                turn = turn.other();
+                                await_opp = true;
                             },
                             Err(_) => panic!("FUCK!!!"),
                         }
+                        match resp {
+                            Resp::STALEMATE =>  {
+                                draw_text(
+                                "stalemate",
+                                (x_origin+sq_sz*2) as f32,
+                                (y_origin+sq_sz*4) as f32,
+                                80.0,
+                                RED
+                                );
+                                stop = true;
+                                continue;
+                            },
+                            Resp::CHECKMATE => {
+                                draw_text(
+                                match turn {
+                                        viggoskj_chess_lib::Color::White => "Black Wins!",
+                                        viggoskj_chess_lib::Color::Black => "White wins!",
+                                    },
+                                    (x_origin+sq_sz*1) as f32,
+                                    (y_origin+sq_sz*4) as f32,
+                                    80.0,
+                                    RED
+                                );
+                                stop = true;
+                                continue;
+                            },
+                            _ => (),
+                        }
                     }
                 }
-
             }  
         }
         draw_board(x_origin,y_origin,sq_sz);
@@ -190,44 +293,15 @@ async fn main() {
         for m in &moves {
             draw_circle((x_origin+m.target_square.col*sq_sz+sq_sz/2) as f32, (y_origin+m.target_square.row*sq_sz+sq_sz/2) as f32, 5.0, RED);
         }
-        let mut state_str = match turn {
-            viggoskj_chess_lib::Color::White => "Turn: White",
-            viggoskj_chess_lib::Color::Black => "Turn: Black"
-        }.to_string();
 
         if is_check(&chess_game.game) {
-            match get_check_state(&chess_game.game).unwrap() {
-                CheckState::Stalemate => {
-                    draw_text(
-                        "stalemate",
-                        (x_origin+sq_sz*2) as f32,
-                        (y_origin+sq_sz*4) as f32,
-                        80.0,
-                        RED
-                    );
-                    stop = true;
-                },
-                CheckState::Checkmate => {
-                    draw_text(
-                    match turn {
-                            viggoskj_chess_lib::Color::White => "Black Wins!",
-                            viggoskj_chess_lib::Color::Black => "White wins!",
-                        },
-                        (x_origin+sq_sz*1) as f32,
-                        (y_origin+sq_sz*4) as f32,
-                        80.0,
-                        RED
-                    );
-                    stop = true;
-                }
-                CheckState::Check => {
-                    state_str.push_str(" (Check)");
-                }
+            if get_check_state(&chess_game.game).unwrap() == CheckState::Check {
+                state_str.push_str(" (Check)");
             }
         }
 
         draw_text(
-            state_str,
+            &state_str,
             30.0,
             30.0,
             40.0,
